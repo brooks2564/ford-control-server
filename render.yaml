@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ford-control-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FORD_EMAIL
+        value: brooksinman@gmail.com
+      - key: FORD_PASSWORD
+        sync: false
+      - key: FORD_VIN
+        value: 3FTTW8JAXSRA17196
+      - key: FORD_API_KEY
+        sync: false
