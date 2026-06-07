@@ -504,7 +504,9 @@ def telemetry_keys():
         data = get_vehicle_status()
         metrics = data.get('metrics', {})
         states  = data.get('states',  {})
-        return jsonify({'metric_keys': sorted(metrics.keys()), 'state_keys': sorted(states.keys())})
+        keys_of_interest = ['tirePressure', 'doorStatus', 'tirePressureStatus', 'hoodStatus']
+        values = {k: metrics.get(k) for k in keys_of_interest}
+        return jsonify({'metric_keys': sorted(metrics.keys()), 'state_keys': sorted(states.keys()), 'values': values})
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
