@@ -48,13 +48,6 @@ _ford = {
     'code_verifier': None,
 }
 
-def _init_token_store():
-    """On startup, prefer Upstash token over env var (it's always the most recent)."""
-    persisted = _upstash_load()
-    if persisted:
-        _ford['refresh_token'] = persisted
-
-_init_token_store()
 _auto = {
     'access_token': None,
     'expires_at':   0,
@@ -90,6 +83,11 @@ def _upstash_load():
         return r.json().get('result')
     except Exception:
         return None
+
+# Load latest token from Upstash on startup (overrides env var with most recent rotated token)
+_persisted = _upstash_load()
+if _persisted:
+    _ford['refresh_token'] = _persisted
 
 # ── Ford token management ─────────────────────────────────────────────────────
 def _login_with_password(email, password):
