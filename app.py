@@ -484,6 +484,9 @@ def auth_complete():
 def health():
     return jsonify({'ok': True,
                     'authenticated': bool(_ford['access_token'] or _ford['refresh_token']),
+                    'has_env_token': bool(FORD_REFRESH_TOKEN_ENV),
+                    'has_mem_token': bool(_ford['refresh_token']),
+                    'env_token_len': len(FORD_REFRESH_TOKEN_ENV),
                     'last_callback': _last_callback})
 
 @app.route('/auth/refresh-token')
