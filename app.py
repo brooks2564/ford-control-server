@@ -49,6 +49,7 @@ _auto = {
     'access_token': None,
     'expires_at':   0,
 }
+_last_callback = {}  # debug: last request to /auth/callback
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────────
 def _make_verifier():
@@ -322,6 +323,7 @@ def auth_start():
 
 @app.route('/auth/callback')
 def auth_callback():
+    _last_callback.update({'args': dict(request.args), 'time': time.time()})
     """Ford redirects here after login (server-side redirect_uri flow)."""
     code  = request.args.get('code', '').strip()
     error = request.args.get('error', '')
@@ -446,7 +448,9 @@ def auth_complete():
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'authenticated': bool(_ford['access_token'] or _ford['refresh_token'])})
+    return jsonify({'ok': True,
+                    'authenticated': bool(_ford['access_token'] or _ford['refresh_token']),
+                    'last_callback': _last_callback})
 
 @app.route('/auth/refresh-token')
 @require_api_key
