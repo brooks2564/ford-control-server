@@ -234,6 +234,28 @@ def auth_page():
                                   authenticated=bool(_auth['access_token']),
                                   message=None, success=False)
 
+@app.route('/auth/start')
+def auth_start():
+    """Direct redirect to Ford login — easier than copying a long URL."""
+    verifier   = _make_verifier()
+    challenge  = _make_challenge(verifier)
+    _auth['code_verifier'] = verifier
+
+    params = {
+        'redirect_uri':         REDIRECT,
+        'response_type':        'code',
+        'max_age':              '3600',
+        'code_challenge':       challenge,
+        'code_challenge_method':'S256',
+        'scope':                f'{CLIENT_ID} openid',
+        'client_id':            CLIENT_ID,
+        'ui_locales':           LOCALE,
+        'language_code':        LOCALE,
+        'ford_application_id':  APP_ID,
+        'country_code':         COUNTRY,
+    }
+    return redirect(f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params))
+
 
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
