@@ -268,7 +268,27 @@ def auth_start():
         'ui_locales': LOCALE, 'language_code': LOCALE,
         'ford_application_id': APP_ID, 'country_code': 'USA',
     }
-    return redirect(f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params))
+    ford_url = f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params)
+    return f'''<!DOCTYPE html>
+<html>
+<head><title>Ford Login</title>
+<style>
+  body {{ font-family: sans-serif; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; height: 100vh;
+          margin: 0; background: #003087; color: white; }}
+  h2 {{ margin-bottom: 8px; }}
+  p  {{ margin-bottom: 32px; opacity: 0.8; text-align: center; }}
+  a  {{ background: white; color: #003087; padding: 16px 40px; border-radius: 8px;
+        text-decoration: none; font-weight: bold; font-size: 1.1rem; }}
+</style>
+</head>
+<body>
+  <h2>Ford Control Setup</h2>
+  <p>Make sure DevTools is open (F12) and Network tab has<br>
+     <strong>Preserve log</strong> checked before clicking.</p>
+  <a href="{ford_url}">Sign in with Ford &rarr;</a>
+</body>
+</html>'''
 
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
