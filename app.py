@@ -12,6 +12,8 @@ app = Flask(__name__)
 FORD_VIN               = os.environ.get('FORD_VIN', '').upper()
 API_KEY                = os.environ.get('FORD_API_KEY', 'changeme')
 FORD_REFRESH_TOKEN_ENV = os.environ.get('FORD_REFRESH_TOKEN', '')
+FORD_EMAIL             = os.environ.get('FORD_EMAIL', '')
+FORD_PASSWORD          = os.environ.get('FORD_PASSWORD', '')
 
 # ── Ford OAuth constants ──────────────────────────────────────────────────────
 OAUTH_ID   = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
@@ -20,6 +22,7 @@ APP_ID     = '71A3AD0A-CF46-4CCF-B473-FC7FE5BC4592'
 LOCALE     = 'en-US'
 REDIRECT   = 'fordapp://userauthorized'
 LOGIN_BASE = f'https://login.ford.com/{OAUTH_ID}/B2C_1A_SignInSignUp_{LOCALE}/oauth2/v2.0'
+ROPC_BASE  = f'https://login.ford.com/{OAUTH_ID}/B2C_1A_ROPC_Auth/oauth2/v2.0'
 B2C_URL    = 'https://api.foundational.ford.com/api/token/v2/cat-with-b2c-access-token'
 REFRESH_URL = 'https://api.foundational.ford.com/api/token/v2/cat-with-refresh-token'
 
@@ -55,6 +58,33 @@ def _make_challenge(v):
     return base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b'=').decode()
 
 # ── Ford token management ─────────────────────────────────────────────────────
+def _login_with_password(email, password):
+    """ROPC grant — exchanges FordPass credentials for tokens, no browser needed."""
+    r = requests.post(f'{ROPC_BASE}/token',
+                      headers={**COMMON_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded'},
+                      data={
+                          'grant_type':  'password',
+                          'username':    email,
+                          'password':    password,
+                          'client_id':   CLIENT_ID,
+                          'scope':       f'openid {CLIENT_ID}',
+                          'response_type': 'token',
+                      }, timeout=15)
+    r.raise_for_status()
+    b2c_token = r.json().get('access_token')
+    if not b2c_token:
+        raise RuntimeError(f'ROPC: no access_token — {r.text[:200]}')
+    r2 = requests.post(B2C_URL,
+                       headers={**COMMON_HEADERS, 'Content-Type': 'application/json',
+                                 'Application-Id': APP_ID},
+                       json={'idpToken': b2c_token}, timeout=15)
+    r2.raise_for_status()
+    data = r2.json()
+    _ford['access_token']  = data['access_token']
+    _ford['refresh_token'] = data.get('refresh_token')
+    _ford['expires_at']    = time.time() + int(data.get('expires_in', 1800)) - 60
+    _auto['access_token']  = None
+
 def _refresh_ford_token():
     r = requests.post(REFRESH_URL,
                       headers={**COMMON_HEADERS, 'Content-Type': 'application/json',
@@ -290,6 +320,25 @@ def auth_start():
 </body>
 </html>'''
 
+@app.route('/auth/login', methods=['GET', 'POST'])
+def auth_login():
+    """Password login — uses FORD_EMAIL + FORD_PASSWORD env vars (or POST body)."""
+    if request.method == 'GET':
+        email = FORD_EMAIL
+        pwd   = FORD_PASSWORD
+    else:
+        data  = request.get_json() or request.form
+        email = data.get('email')    or FORD_EMAIL
+        pwd   = data.get('password') or FORD_PASSWORD
+    if not email or not pwd:
+        return jsonify({'error': 'Set FORD_EMAIL and FORD_PASSWORD env vars on Render, or POST {email, password}'}), 400
+    try:
+        _login_with_password(email, pwd)
+        return jsonify({'ok': True, 'message': 'Logged in! Save this refresh token to FORD_REFRESH_TOKEN on Render.',
+                        'refresh_token': _ford.get('refresh_token', '')})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
     redirect_url = request.form.get('redirect_url', '').strip()
@@ -464,6 +513,14 @@ def climate():
         return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 502
+
+# Auto-login on startup if credentials available and no refresh token seeded from env
+if FORD_EMAIL and FORD_PASSWORD and not FORD_REFRESH_TOKEN_ENV:
+    try:
+        _login_with_password(FORD_EMAIL, FORD_PASSWORD)
+        print(f'Startup auto-login succeeded for {FORD_EMAIL}')
+    except Exception as _e:
+        print(f'Startup auto-login failed: {_e}')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
