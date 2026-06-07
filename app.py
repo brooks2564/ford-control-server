@@ -321,6 +321,13 @@ def auth_complete():
 def health():
     return jsonify({'ok': True, 'authenticated': bool(_ford['access_token'] or _ford['refresh_token'])})
 
+@app.route('/auth/refresh-token')
+@require_api_key
+def get_refresh_token():
+    if not _ford['refresh_token']:
+        return jsonify({'error': 'not authenticated'}), 403
+    return jsonify({'refresh_token': _ford['refresh_token']})
+
 # ── Vehicle routes ────────────────────────────────────────────────────────────
 @app.route('/status')
 @require_api_key
