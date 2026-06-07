@@ -320,6 +320,64 @@ def auth_start():
 </body>
 </html>'''
 
+@app.route('/auth/callback')
+def auth_callback():
+    """Ford redirects here after login (server-side redirect_uri flow)."""
+    code  = request.args.get('code', '').strip()
+    error = request.args.get('error', '')
+    if error:
+        return f'<h2>Ford error: {error}</h2><p>{request.args.get("error_description","")}</p>', 400
+    if not code:
+        return '<h2>No code returned by Ford.</h2>', 400
+    verifier = _ford.get('code_verifier')
+    if not verifier:
+        return '<h2>Session expired. <a href="/auth/server">Try again</a>.</h2>', 400
+    try:
+        r = requests.post(f'{LOGIN_BASE}/token',
+                          headers={**COMMON_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded'},
+                          data={'client_id': CLIENT_ID, 'scope': f'{CLIENT_ID} openid',
+                                'redirect_uri': request.url_root.rstrip('/') + '/auth/callback',
+                                'grant_type': 'authorization_code',
+                                'code': code, 'code_verifier': verifier}, timeout=15)
+        r.raise_for_status()
+        b2c_token = r.json()['access_token']
+        r2 = requests.post(B2C_URL,
+                           headers={**COMMON_HEADERS, 'Content-Type': 'application/json',
+                                     'Application-Id': APP_ID},
+                           json={'idpToken': b2c_token}, timeout=15)
+        r2.raise_for_status()
+        data = r2.json()
+        _ford['access_token']  = data['access_token']
+        _ford['refresh_token'] = data.get('refresh_token')
+        _ford['expires_at']    = time.time() + int(data.get('expires_in', 1800)) - 60
+        _ford['code_verifier'] = None
+        _auto['access_token']  = None
+        rt = _ford['refresh_token'] or ''
+        return f'''<html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+<h2 style="color:green">&#10003; Authentication successful!</h2>
+<p>Your Pebble app is ready to use.</p>
+<p><strong>Save this refresh token as FORD_REFRESH_TOKEN in Render so auth survives restarts:</strong></p>
+<textarea rows="4" style="width:100%;font-size:0.8rem">{rt}</textarea>
+</body></html>'''
+    except Exception as e:
+        return f'<h2>Auth failed: {e}</h2>', 502
+
+@app.route('/auth/server')
+def auth_server():
+    """Auth flow using our server URL as redirect_uri — no fordapp:// needed."""
+    verifier  = _make_verifier()
+    challenge = _make_challenge(verifier)
+    _ford['code_verifier'] = verifier
+    callback  = request.url_root.rstrip('/') + '/auth/callback'
+    params = {
+        'redirect_uri': callback, 'response_type': 'code', 'max_age': '3600',
+        'code_challenge': challenge, 'code_challenge_method': 'S256',
+        'scope': f'{CLIENT_ID} openid', 'client_id': CLIENT_ID,
+        'ui_locales': LOCALE, 'language_code': LOCALE,
+        'ford_application_id': APP_ID, 'country_code': 'USA',
+    }
+    return redirect(f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params))
+
 @app.route('/auth/login', methods=['GET', 'POST'])
 def auth_login():
     """Password login — uses FORD_EMAIL + FORD_PASSWORD env vars (or POST body)."""
