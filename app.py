@@ -1,34 +1,33 @@
 """
 Ford Control Server — Flask middleware for Pebble Ford Control watchapp.
-Uses Ford's current OAuth 2.0 + PKCE auth flow (as of 2025-2026).
-
-One-time setup: visit /auth in a browser to authenticate with Ford.
-After that, tokens auto-refresh until the server restarts.
+Uses Ford OAuth 2.0 + PKCE for auth, then Autonomic API for vehicle commands.
+Ford decommissioned usapi.cv.ford.com — all vehicle calls now go to api.autonomic.ai.
 """
 
-import os, time, hashlib, base64, json, secrets, urllib.parse
-import requests
+import os, time, hashlib, base64, urllib.parse, requests
 from flask import Flask, jsonify, request, redirect, render_template_string
 
 app = Flask(__name__)
 
-FORD_VIN              = os.environ.get('FORD_VIN', '').upper()
-API_KEY               = os.environ.get('FORD_API_KEY', 'changeme')
+FORD_VIN               = os.environ.get('FORD_VIN', '').upper()
+API_KEY                = os.environ.get('FORD_API_KEY', 'changeme')
 FORD_REFRESH_TOKEN_ENV = os.environ.get('FORD_REFRESH_TOKEN', '')
 
 # ── Ford OAuth constants ──────────────────────────────────────────────────────
-OAUTH_ID    = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
-CLIENT_ID   = '09852200-05fd-41f6-8c21-d36d3497dc64'
-APP_ID      = '71A3AD0A-CF46-4CCF-B473-FC7FE5BC4592'
-LOCALE      = 'en-US'
-COUNTRY     = 'USA'
-REDIRECT    = 'fordapp://userauthorized'
+OAUTH_ID   = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
+CLIENT_ID  = '09852200-05fd-41f6-8c21-d36d3497dc64'
+APP_ID     = '71A3AD0A-CF46-4CCF-B473-FC7FE5BC4592'
+LOCALE     = 'en-US'
+REDIRECT   = 'fordapp://userauthorized'
+LOGIN_BASE = f'https://login.ford.com/{OAUTH_ID}/B2C_1A_SignInSignUp_{LOCALE}/oauth2/v2.0'
+B2C_URL    = 'https://api.foundational.ford.com/api/token/v2/cat-with-b2c-access-token'
+REFRESH_URL = 'https://api.foundational.ford.com/api/token/v2/cat-with-refresh-token'
 
-LOGIN_BASE  = f'https://login.ford.com/{OAUTH_ID}/B2C_1A_SignInSignUp_{LOCALE}/oauth2/v2.0'
-TOKEN_URL   = f'{LOGIN_BASE}/token'
-B2C_TOKEN_URL  = 'https://api.foundational.ford.com/api/token/v2/cat-with-b2c-access-token'
-REFRESH_URL    = 'https://api.foundational.ford.com/api/token/v2/cat-with-refresh-token'
-API_BASE       = 'https://usapi.cv.ford.com/api'
+# ── Autonomic API constants ───────────────────────────────────────────────────
+AUTO_TOKEN_URL  = 'https://accounts.autonomic.ai/v1/auth/oidc/token'
+AUTO_API        = 'https://api.autonomic.ai/v1'
+AUTO_CMD_URL    = f'{AUTO_API}/command/vehicles/{FORD_VIN}/commands'
+AUTO_STATUS_URL = f'{AUTO_API}/telemetry/sources/fordpass/vehicles/{FORD_VIN}'
 
 COMMON_HEADERS = {
     'Accept-Encoding': 'gzip',
@@ -36,50 +35,71 @@ COMMON_HEADERS = {
     'User-Agent': 'okhttp/4.12.0',
 }
 
-# ── In-memory token store ─────────────────────────────────────────────────────
-_auth = {
+# ── Token store ───────────────────────────────────────────────────────────────
+_ford = {
     'access_token':  None,
-    'refresh_token': FORD_REFRESH_TOKEN_ENV or None,  # pre-seed from env var
+    'refresh_token': FORD_REFRESH_TOKEN_ENV or None,
     'expires_at':    0,
     'code_verifier': None,
+}
+_auto = {
+    'access_token': None,
+    'expires_at':   0,
 }
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────────
 def _make_verifier():
     return base64.urlsafe_b64encode(os.urandom(40)).rstrip(b'=').decode()
 
-def _make_challenge(verifier):
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+def _make_challenge(v):
+    return base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b'=').decode()
 
-# ── Token management ──────────────────────────────────────────────────────────
-def _refresh_access_token():
+# ── Ford token management ─────────────────────────────────────────────────────
+def _refresh_ford_token():
     r = requests.post(REFRESH_URL,
                       headers={**COMMON_HEADERS, 'Content-Type': 'application/json',
                                 'Application-Id': APP_ID},
-                      json={'refresh_token': _auth['refresh_token']},
-                      timeout=15)
+                      json={'refresh_token': _ford['refresh_token']}, timeout=15)
     r.raise_for_status()
     data = r.json()
-    _auth['access_token'] = data['access_token']
-    _auth['expires_at']   = time.time() + int(data.get('expires_in', 1800)) - 60
+    _ford['access_token'] = data['access_token']
+    _ford['expires_at']   = time.time() + int(data.get('expires_in', 1800)) - 60
     if data.get('refresh_token'):
-        _auth['refresh_token'] = data['refresh_token']
+        _ford['refresh_token'] = data['refresh_token']
+    _auto['access_token'] = None  # invalidate autonomic token
 
-def get_access_token():
-    if not _auth['access_token']:
+def get_ford_token():
+    if not _ford['refresh_token'] and not _ford['access_token']:
         raise RuntimeError('Not authenticated — visit /auth to log in')
-    if time.time() >= _auth['expires_at']:
-        _refresh_access_token()
-    return _auth['access_token']
+    if not _ford['access_token'] or time.time() >= _ford['expires_at']:
+        _refresh_ford_token()
+    return _ford['access_token']
 
-def api_headers():
-    return {
-        **COMMON_HEADERS,
-        'Application-Id': APP_ID,
-        'auth-token': get_access_token(),
-        'Content-Type': 'application/json',
-    }
+# ── Autonomic token management ────────────────────────────────────────────────
+def get_auto_token():
+    if _auto['access_token'] and time.time() < _auto['expires_at']:
+        return _auto['access_token']
+    ford_token = get_ford_token()
+    r = requests.post(AUTO_TOKEN_URL,
+                      headers={'Accept': '*/*',
+                               'Content-Type': 'application/x-www-form-urlencoded'},
+                      data={
+                          'subject_token':      ford_token,
+                          'subject_issuer':     'fordpass',
+                          'client_id':          'fordpass-prod',
+                          'grant_type':         'urn:ietf:params:oauth:grant-type:token-exchange',
+                          'subject_token_type': 'urn:ietf:params:oauth:token-type:jwt',
+                      }, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    _auto['access_token'] = data['access_token']
+    _auto['expires_at']   = time.time() + int(data.get('expires_in', 1800)) - 60
+    return _auto['access_token']
+
+def auto_headers():
+    return {'Authorization': f'Bearer {get_auto_token()}',
+            'Content-Type': 'application/json',
+            **COMMON_HEADERS}
 
 # ── Auth guard ────────────────────────────────────────────────────────────────
 def require_api_key(f):
@@ -91,55 +111,69 @@ def require_api_key(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── Status parsing ────────────────────────────────────────────────────────────
-def parse_status(vs):
-    locked  = vs.get('lockStatus', {}).get('value', 'LOCKED').upper() == 'LOCKED'
-    running = vs.get('ignitionStatus', {}).get('value', 'Off').lower() not in ('off', 'offrun')
+# ── Vehicle data helpers ──────────────────────────────────────────────────────
+def get_vehicle_status():
+    r = requests.get(AUTO_STATUS_URL, headers=auto_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def parse_status(data):
+    metrics = data.get('metrics', {})
+    states  = data.get('states',  {})
+
+    def metric_val(key):
+        m = metrics.get(key, {})
+        return m.get('value') if isinstance(m, dict) else None
+
+    def state_val(key):
+        s = states.get(key, {})
+        return s.get('value') if isinstance(s, dict) else None
+
+    locked_raw  = metric_val('doorLockStatus') or state_val('lockStatus') or 'LOCKED'
+    engine_raw  = metric_val('ignitionStatus') or state_val('ignitionStatus') or 'Off'
+    locked      = str(locked_raw).upper() in ('LOCKED', 'LOCK', '1', 'TRUE')
+    running     = str(engine_raw).lower() not in ('off', 'offrun', '0', 'false')
+
     return {'is_locked': locked, 'is_running': running, 'model_name': 'Maverick'}
 
-def parse_info(vs):
+def parse_info(data):
+    metrics = data.get('metrics', {})
+
+    def mv(key):
+        m = metrics.get(key, {})
+        v = m.get('value') if isinstance(m, dict) else None
+        try: return float(v)
+        except: return None
+
     def psi(kpa):
         try: return int(float(kpa) * 0.145038)
         except: return -1
 
-    fuel = -1
-    f = vs.get('fuel', {})
-    if f: fuel = int(float(f.get('fuelLevel', -1)))
+    fuel = mv('fuelLevel') or mv('batteryStateOfCharge')
+    oil  = mv('oilLifeRemaining') or mv('engineOilLife')
+    fl   = mv('tirePressureFL') or mv('leftFrontTirePressure')
+    fr   = mv('tirePressureFR') or mv('rightFrontTirePressure')
+    rl   = mv('tirePressureRL') or mv('leftRearTirePressure')
+    rr   = mv('tirePressureRR') or mv('rightRearTirePressure')
 
-    oil = -1
-    o = vs.get('oil', {})
-    if o: oil = int(float(o.get('oilLifeActual', -1)))
-
-    tpms = vs.get('TPMS', {})
     return {
-        'fuel_level': fuel,
-        'oil_life':   oil,
-        'tire_fl': psi(tpms.get('leftFrontTirePressure',  {}).get('value', -1)),
-        'tire_fr': psi(tpms.get('rightFrontTirePressure', {}).get('value', -1)),
-        'tire_rl': psi(tpms.get('leftRearTirePressure',   {}).get('value', -1)),
-        'tire_rr': psi(tpms.get('rightRearTirePressure',  {}).get('value', -1)),
+        'fuel_level': int(fuel) if fuel is not None else -1,
+        'oil_life':   int(oil)  if oil  is not None else -1,
+        'tire_fl': psi(fl) if fl else -1,
+        'tire_fr': psi(fr) if fr else -1,
+        'tire_rl': psi(rl) if rl else -1,
+        'tire_rr': psi(rr) if rr else -1,
     }
 
-def get_vehicle_status():
-    r = requests.get(
-        f'{API_BASE}/vehicles/v4/{FORD_VIN}/status',
-        params={'lrdt': '01-01-1970 00:00:00'},
-        headers=api_headers(), timeout=15)
+def send_command(cmd_type, properties=None):
+    body = {'type': cmd_type, 'wakeUp': True, 'tags': {}}
+    if properties:
+        body['properties'] = properties
+    r = requests.post(AUTO_CMD_URL, headers=auto_headers(), json=body, timeout=20)
     r.raise_for_status()
-    return r.json()['vehiclestatus']
+    return r.json()
 
-def poll_command(url, command_id, retries=6):
-    for _ in range(retries):
-        r = requests.get(f'{url}/{command_id}', headers=api_headers(), timeout=15)
-        result = r.json()
-        if result.get('status') == 200:
-            return True
-        if result.get('status') != 552:
-            return False
-        time.sleep(5)
-    return False
-
-# ── Auth HTML page ────────────────────────────────────────────────────────────
+# ── Auth HTML ─────────────────────────────────────────────────────────────────
 AUTH_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -176,18 +210,15 @@ AUTH_PAGE = """
   {% endif %}
 
   <div class="step">
-    <h2>Step 1 — Open Ford login in a desktop browser</h2>
-    <p>Click the button below. <strong>Use a desktop/laptop browser, not your phone.</strong>
-       Log in with your FordPass email and password.</p>
+    <h2>Step 1 — Open Ford login in Chrome with DevTools open</h2>
+    <p>Click below. Before logging in, open DevTools (F12) → Network tab → check <strong>Preserve log</strong>.</p>
     <a class="btn" href="{{ auth_url }}" target="_blank">Log in with Ford →</a>
   </div>
 
   <div class="step">
-    <h2>Step 2 — Copy the redirect URL</h2>
-    <p>After logging in, your browser will show an error like
-       <em>"can't open fordapp://"</em> — that's expected.<br>
-       Copy the <strong>full URL</strong> from your browser's address bar.
-       It starts with <code>fordapp://userauthorized/?code=</code></p>
+    <h2>Step 2 — Copy the fordapp:// URL</h2>
+    <p>After logging in, find the <strong>userauthorized</strong> entry in the Network tab.
+       Click it and copy the full Request URL starting with <code>fordapp://userauthorized/?code=</code></p>
   </div>
 
   <div class="step">
@@ -210,161 +241,118 @@ AUTH_PAGE = """
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route('/auth')
 def auth_page():
-    verifier   = _make_verifier()
-    challenge  = _make_challenge(verifier)
-    _auth['code_verifier'] = verifier
-
+    verifier  = _make_verifier()
+    challenge = _make_challenge(verifier)
+    _ford['code_verifier'] = verifier
     params = {
-        'redirect_uri':         REDIRECT,
-        'response_type':        'code',
-        'max_age':              '3600',
-        'code_challenge':       challenge,
-        'code_challenge_method':'S256',
-        'scope':                f'{CLIENT_ID} openid',
-        'client_id':            CLIENT_ID,
-        'ui_locales':           LOCALE,
-        'language_code':        LOCALE,
-        'ford_application_id':  APP_ID,
-        'country_code':         COUNTRY,
+        'redirect_uri': REDIRECT, 'response_type': 'code', 'max_age': '3600',
+        'code_challenge': challenge, 'code_challenge_method': 'S256',
+        'scope': f'{CLIENT_ID} openid', 'client_id': CLIENT_ID,
+        'ui_locales': LOCALE, 'language_code': LOCALE,
+        'ford_application_id': APP_ID, 'country_code': 'USA',
     }
     auth_url = f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params)
-
-    return render_template_string(AUTH_PAGE,
-                                  auth_url=auth_url,
-                                  authenticated=bool(_auth['access_token']),
+    return render_template_string(AUTH_PAGE, auth_url=auth_url,
+                                  authenticated=bool(_ford['access_token']),
                                   message=None, success=False)
 
 @app.route('/auth/start')
 def auth_start():
-    """Direct redirect to Ford login — easier than copying a long URL."""
-    verifier   = _make_verifier()
-    challenge  = _make_challenge(verifier)
-    _auth['code_verifier'] = verifier
-
+    verifier  = _make_verifier()
+    challenge = _make_challenge(verifier)
+    _ford['code_verifier'] = verifier
     params = {
-        'redirect_uri':         REDIRECT,
-        'response_type':        'code',
-        'max_age':              '3600',
-        'code_challenge':       challenge,
-        'code_challenge_method':'S256',
-        'scope':                f'{CLIENT_ID} openid',
-        'client_id':            CLIENT_ID,
-        'ui_locales':           LOCALE,
-        'language_code':        LOCALE,
-        'ford_application_id':  APP_ID,
-        'country_code':         COUNTRY,
+        'redirect_uri': REDIRECT, 'response_type': 'code', 'max_age': '3600',
+        'code_challenge': challenge, 'code_challenge_method': 'S256',
+        'scope': f'{CLIENT_ID} openid', 'client_id': CLIENT_ID,
+        'ui_locales': LOCALE, 'language_code': LOCALE,
+        'ford_application_id': APP_ID, 'country_code': 'USA',
     }
     return redirect(f'{LOGIN_BASE}/authorize?' + urllib.parse.urlencode(params))
-
 
 @app.route('/auth/complete', methods=['POST'])
 def auth_complete():
     redirect_url = request.form.get('redirect_url', '').strip()
-    verifier     = _auth.get('code_verifier')
-
+    verifier     = _ford.get('code_verifier')
     if not verifier:
-        return render_template_string(AUTH_PAGE,
-                                      auth_url='', authenticated=False,
+        return render_template_string(AUTH_PAGE, auth_url='', authenticated=False,
                                       message='Session expired — go back to /auth and start again.',
                                       success=False)
-
-    # Extract code from fordapp://userauthorized/?code=XXX
     try:
         parsed = urllib.parse.urlparse(redirect_url)
         code   = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
         if not code:
-            raise ValueError('No code found')
+            raise ValueError('No code')
     except Exception:
-        return render_template_string(AUTH_PAGE,
-                                      auth_url='', authenticated=False,
-                                      message='Could not find authorization code in that URL. Make sure you copied the full URL.',
+        return render_template_string(AUTH_PAGE, auth_url='', authenticated=False,
+                                      message='Could not find code in that URL.',
                                       success=False)
-
     try:
-        # Step 3: Exchange code for B2C token
-        r = requests.post(TOKEN_URL,
+        r = requests.post(f'{LOGIN_BASE}/token',
                           headers={**COMMON_HEADERS,
                                    'Content-Type': 'application/x-www-form-urlencoded'},
-                          data={
-                              'client_id':     CLIENT_ID,
-                              'scope':         f'{CLIENT_ID} openid',
-                              'redirect_uri':  REDIRECT,
-                              'grant_type':    'authorization_code',
-                              'code':          code,
-                              'code_verifier': verifier,
-                          }, timeout=15)
+                          data={'client_id': CLIENT_ID, 'scope': f'{CLIENT_ID} openid',
+                                'redirect_uri': REDIRECT, 'grant_type': 'authorization_code',
+                                'code': code, 'code_verifier': verifier}, timeout=15)
         r.raise_for_status()
         b2c_token = r.json()['access_token']
 
-        # Step 4: Exchange B2C token for Ford API token
-        r2 = requests.post(B2C_TOKEN_URL,
-                           headers={**COMMON_HEADERS,
-                                    'Content-Type': 'application/json',
-                                    'Application-Id': APP_ID},
-                           json={'idpToken': b2c_token},
-                           timeout=15)
+        r2 = requests.post(B2C_URL,
+                           headers={**COMMON_HEADERS, 'Content-Type': 'application/json',
+                                     'Application-Id': APP_ID},
+                           json={'idpToken': b2c_token}, timeout=15)
         r2.raise_for_status()
         data = r2.json()
+        _ford['access_token']  = data['access_token']
+        _ford['refresh_token'] = data['refresh_token']
+        _ford['expires_at']    = time.time() + int(data.get('expires_in', 1800)) - 60
+        _ford['code_verifier'] = None
+        _auto['access_token']  = None
 
-        _auth['access_token']  = data['access_token']
-        _auth['refresh_token'] = data['refresh_token']
-        _auth['expires_at']    = time.time() + int(data.get('expires_in', 1800)) - 60
-        _auth['code_verifier'] = None
-
-        return render_template_string(AUTH_PAGE,
-                                      auth_url='', authenticated=True,
+        return render_template_string(AUTH_PAGE, auth_url='', authenticated=True,
                                       message='✅ Authentication successful! Your Pebble app is ready.',
                                       success=True)
     except Exception as e:
-        return render_template_string(AUTH_PAGE,
-                                      auth_url='', authenticated=False,
-                                      message=f'Auth failed: {str(e)}',
-                                      success=False)
-
+        return render_template_string(AUTH_PAGE, auth_url='', authenticated=False,
+                                      message=f'Auth failed: {str(e)}', success=False)
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'authenticated': bool(_auth['access_token'])})
-
+    return jsonify({'ok': True, 'authenticated': bool(_ford['access_token'] or _ford['refresh_token'])})
 
 # ── Vehicle routes ────────────────────────────────────────────────────────────
 @app.route('/status')
 @require_api_key
 def status():
     try:
-        vs = get_vehicle_status()
-        return jsonify(parse_status(vs))
+        data = get_vehicle_status()
+        return jsonify(parse_status(data))
     except RuntimeError as e:
         return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/info')
 @require_api_key
 def info():
     try:
-        vs = get_vehicle_status()
-        result = parse_status(vs)
-        result.update(parse_info(vs))
+        data   = get_vehicle_status()
+        result = parse_status(data)
+        result.update(parse_info(data))
         return jsonify(result)
     except RuntimeError as e:
         return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/lock', methods=['POST'])
 @require_api_key
 def lock():
     try:
-        url = f'{API_BASE}/vehicles/v2/{FORD_VIN}/doors/lock'
-        r = requests.put(url, headers=api_headers(), timeout=15)
-        r.raise_for_status()
-        poll_command(url, r.json().get('commandId'))
-        vs = get_vehicle_status()
-        result = parse_status(vs)
+        send_command('lock')
+        time.sleep(3)
+        result = parse_status(get_vehicle_status())
         result['is_locked'] = True
         return jsonify(result)
     except RuntimeError as e:
@@ -372,17 +360,13 @@ def lock():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/unlock', methods=['POST'])
 @require_api_key
 def unlock():
     try:
-        url = f'{API_BASE}/vehicles/v2/{FORD_VIN}/doors/lock'
-        r = requests.delete(url, headers=api_headers(), timeout=15)
-        r.raise_for_status()
-        poll_command(url, r.json().get('commandId'))
-        vs = get_vehicle_status()
-        result = parse_status(vs)
+        send_command('unlock')
+        time.sleep(3)
+        result = parse_status(get_vehicle_status())
         result['is_locked'] = False
         return jsonify(result)
     except RuntimeError as e:
@@ -390,17 +374,13 @@ def unlock():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/start', methods=['POST'])
 @require_api_key
 def start():
     try:
-        url = f'{API_BASE}/vehicles/v2/{FORD_VIN}/engine/start'
-        r = requests.put(url, headers=api_headers(), timeout=20)
-        r.raise_for_status()
-        poll_command(url, r.json().get('commandId'))
-        vs = get_vehicle_status()
-        result = parse_status(vs)
+        send_command('remoteStart')
+        time.sleep(4)
+        result = parse_status(get_vehicle_status())
         result['is_running'] = True
         return jsonify(result)
     except RuntimeError as e:
@@ -408,17 +388,13 @@ def start():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/stop', methods=['POST'])
 @require_api_key
 def stop():
     try:
-        url = f'{API_BASE}/vehicles/v2/{FORD_VIN}/engine/start'
-        r = requests.delete(url, headers=api_headers(), timeout=20)
-        r.raise_for_status()
-        poll_command(url, r.json().get('commandId'))
-        vs = get_vehicle_status()
-        result = parse_status(vs)
+        send_command('cancelRemoteStart')
+        time.sleep(3)
+        result = parse_status(get_vehicle_status())
         result['is_running'] = False
         return jsonify(result)
     except RuntimeError as e:
@@ -426,14 +402,11 @@ def stop():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/find', methods=['POST'])
 @require_api_key
 def find():
     try:
-        url = f'{API_BASE}/vehicles/v2/{FORD_VIN}/alert'
-        r = requests.put(url, headers=api_headers(), timeout=15)
-        r.raise_for_status()
+        send_command('startPanicCue', {'duration': 5})
         return jsonify({'ok': True, 'is_locked': True, 'is_running': False,
                         'model_name': 'Maverick'})
     except RuntimeError as e:
@@ -441,37 +414,22 @@ def find():
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
-
 @app.route('/climate', methods=['POST'])
 @require_api_key
 def climate():
     body    = request.get_json() or {}
-    seat    = bool(body.get('seat', False))
-    wheel   = bool(body.get('wheel', False))
+    seat    = bool(body.get('seat',    False))
+    wheel   = bool(body.get('wheel',   False))
     defrost = bool(body.get('defrost', False))
-    temp    = int(body.get('temp', 72))
-
+    temp    = int(body.get('temp',     72))
     try:
-        hdrs = api_headers()
-
-        requests.put(f'{API_BASE}/vehicles/v2/{FORD_VIN}/seatHeat',
-                     headers=hdrs,
-                     json={'driverSeatHeatLevel':    3 if seat else 0,
-                           'passengerSeatHeatLevel': 3 if seat else 0},
-                     timeout=15)
-
-        requests.put(f'{API_BASE}/vehicles/v2/{FORD_VIN}/steeringWheelHeat',
-                     headers=hdrs,
-                     json={'steeringWheelHeat': 'On' if wheel else 'Off'},
-                     timeout=15)
-
-        requests.put(f'{API_BASE}/vehicles/v2/{FORD_VIN}/defrost',
-                     headers=hdrs,
-                     json={'defrostZone': 'FRONT', 'duration': 10 if defrost else 0},
-                     timeout=15)
-
-        vs = get_vehicle_status()
-        result = parse_status(vs)
+        hdrs = auto_headers()
+        if seat or wheel or defrost:
+            send_command('startOnDemandPreconditioning',
+                         {'preconditioningDuration': 10,
+                          'vehiclePreconditionSetting': 1})
+        data   = get_vehicle_status()
+        result = parse_status(data)
         result.update({'climate_temp': temp, 'climate_seat': seat,
                        'climate_wheel': wheel, 'climate_defrost': defrost})
         return jsonify(result)
@@ -479,7 +437,6 @@ def climate():
         return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 502
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
