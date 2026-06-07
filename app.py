@@ -12,8 +12,9 @@ from flask import Flask, jsonify, request, redirect, render_template_string
 
 app = Flask(__name__)
 
-FORD_VIN     = os.environ.get('FORD_VIN', '').upper()
-API_KEY      = os.environ.get('FORD_API_KEY', 'changeme')
+FORD_VIN              = os.environ.get('FORD_VIN', '').upper()
+API_KEY               = os.environ.get('FORD_API_KEY', 'changeme')
+FORD_REFRESH_TOKEN_ENV = os.environ.get('FORD_REFRESH_TOKEN', '')
 
 # ── Ford OAuth constants ──────────────────────────────────────────────────────
 OAUTH_ID    = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
@@ -38,7 +39,7 @@ COMMON_HEADERS = {
 # ── In-memory token store ─────────────────────────────────────────────────────
 _auth = {
     'access_token':  None,
-    'refresh_token': None,
+    'refresh_token': FORD_REFRESH_TOKEN_ENV or None,  # pre-seed from env var
     'expires_at':    0,
     'code_verifier': None,
 }
