@@ -14,8 +14,8 @@ API_KEY                = os.environ.get('FORD_API_KEY', 'changeme')
 FORD_REFRESH_TOKEN_ENV = os.environ.get('FORD_REFRESH_TOKEN', '')
 FORD_EMAIL             = os.environ.get('FORD_EMAIL', '')
 FORD_PASSWORD          = os.environ.get('FORD_PASSWORD', '')
-UPSTASH_URL            = os.environ.get('UPSTASH_REDIS_URL', '').rstrip('/')
-UPSTASH_TOKEN          = os.environ.get('UPSTASH_REDIS_TOKEN', '')
+UPSTASH_URL            = os.environ.get('UPSTASH_REDIS_URL', 'https://mint-dodo-83959.upstash.io').rstrip('/')
+UPSTASH_TOKEN          = os.environ.get('UPSTASH_REDIS_TOKEN', 'gQAAAAAAAUf3AAIgcDI1MjliYTBhZjU3NGM0MjI5OTczYzA4YTgyN2ZhYmRjZQ')
 
 # ── Ford OAuth constants ──────────────────────────────────────────────────────
 OAUTH_ID   = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
@@ -80,7 +80,8 @@ def _upstash_load():
         r = requests.get(f'{UPSTASH_URL}/get/ford_refresh_token',
                          headers={'Authorization': f'Bearer {UPSTASH_TOKEN}'},
                          timeout=5)
-        return r.json().get('result')
+        val = r.json().get('result')
+        return val.strip('"') if isinstance(val, str) else val
     except Exception:
         return None
 
