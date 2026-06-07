@@ -209,24 +209,41 @@ def parse_info(data):
         try: return float(v)
         except: return None
 
-    def psi(kpa):
-        try: return int(float(kpa) * 0.145038)
-        except: return -1
+    # Tire pressure — array of {vehicleWheel, value (kPa)}
+    tires = {}
+    for t in (metrics.get('tirePressure') or []):
+        wheel = t.get('vehicleWheel', '')
+        val   = t.get('value')
+        if val is not None:
+            tires[wheel] = int(float(val) * 0.145038)  # kPa → psi
+
+    # Door status — array of {vehicleDoor, vehicleOccupantRole, value}
+    # Front doors use vehicleDoor=UNSPECIFIED_FRONT + role=DRIVER/PASSENGER
+    door_open = {'FL': False, 'FR': False, 'RL': False, 'RR': False}
+    for d in (metrics.get('doorStatus') or []):
+        vd   = d.get('vehicleDoor', '')
+        role = d.get('vehicleOccupantRole', '')
+        open_ = str(d.get('value', 'CLOSED')).upper() != 'CLOSED'
+        if   vd == 'UNSPECIFIED_FRONT' and role == 'DRIVER':    door_open['FL'] = open_
+        elif vd == 'UNSPECIFIED_FRONT' and role == 'PASSENGER': door_open['FR'] = open_
+        elif vd == 'REAR_LEFT':                                  door_open['RL'] = open_
+        elif vd == 'REAR_RIGHT':                                 door_open['RR'] = open_
+
+    # Encode door state as bitmask: bit0=FL, bit1=FR, bit2=RL, bit3=RR (1=open)
+    door_mask = (door_open['FL'] << 0) | (door_open['FR'] << 1) | \
+                (door_open['RL'] << 2) | (door_open['RR'] << 3)
 
     fuel = mv('fuelLevel') or mv('batteryStateOfCharge')
     oil  = mv('oilLifeRemaining') or mv('engineOilLife')
-    fl   = mv('tirePressureFL') or mv('leftFrontTirePressure')
-    fr   = mv('tirePressureFR') or mv('rightFrontTirePressure')
-    rl   = mv('tirePressureRL') or mv('leftRearTirePressure')
-    rr   = mv('tirePressureRR') or mv('rightRearTirePressure')
 
     return {
-        'fuel_level': int(fuel) if fuel is not None else -1,
-        'oil_life':   int(oil)  if oil  is not None else -1,
-        'tire_fl': psi(fl) if fl else -1,
-        'tire_fr': psi(fr) if fr else -1,
-        'tire_rl': psi(rl) if rl else -1,
-        'tire_rr': psi(rr) if rr else -1,
+        'fuel_level':  int(fuel) if fuel is not None else -1,
+        'oil_life':    int(oil)  if oil  is not None else -1,
+        'tire_fl':     tires.get('FRONT_LEFT',  -1),
+        'tire_fr':     tires.get('FRONT_RIGHT', -1),
+        'tire_rl':     tires.get('REAR_LEFT',   -1),
+        'tire_rr':     tires.get('REAR_RIGHT',  -1),
+        'door_status': door_mask,
     }
 
 def send_command(cmd_type, properties=None):
