@@ -4,7 +4,7 @@ Uses Ford OAuth 2.0 + PKCE for auth, then Autonomic API for vehicle commands.
 Ford decommissioned usapi.cv.ford.com — all vehicle calls now go to api.autonomic.ai.
 """
 
-import os, time, hashlib, base64, urllib.parse, requests
+import os, time, hashlib, base64, urllib.parse, requests, json
 from flask import Flask, jsonify, request, redirect, render_template_string
 
 app = Flask(__name__)
@@ -14,6 +14,8 @@ API_KEY                = os.environ.get('FORD_API_KEY', 'changeme')
 FORD_REFRESH_TOKEN_ENV = os.environ.get('FORD_REFRESH_TOKEN', '')
 FORD_EMAIL             = os.environ.get('FORD_EMAIL', '')
 FORD_PASSWORD          = os.environ.get('FORD_PASSWORD', '')
+UPSTASH_URL            = os.environ.get('UPSTASH_REDIS_URL', '').rstrip('/')
+UPSTASH_TOKEN          = os.environ.get('UPSTASH_REDIS_TOKEN', '')
 
 # ── Ford OAuth constants ──────────────────────────────────────────────────────
 OAUTH_ID   = '4566605f-43a7-400a-946e-89cc9fdb0bd7'
@@ -45,6 +47,14 @@ _ford = {
     'expires_at':    0,
     'code_verifier': None,
 }
+
+def _init_token_store():
+    """On startup, prefer Upstash token over env var (it's always the most recent)."""
+    persisted = _upstash_load()
+    if persisted:
+        _ford['refresh_token'] = persisted
+
+_init_token_store()
 _auto = {
     'access_token': None,
     'expires_at':   0,
@@ -57,6 +67,29 @@ def _make_verifier():
 
 def _make_challenge(v):
     return base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b'=').decode()
+
+# ── Upstash Redis persistence ─────────────────────────────────────────────────
+def _upstash_save(token):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return
+    try:
+        requests.post(f'{UPSTASH_URL}/set/ford_refresh_token',
+                      headers={'Authorization': f'Bearer {UPSTASH_TOKEN}',
+                               'Content-Type': 'application/json'},
+                      json=token, timeout=5)
+    except Exception:
+        pass
+
+def _upstash_load():
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        r = requests.get(f'{UPSTASH_URL}/get/ford_refresh_token',
+                         headers={'Authorization': f'Bearer {UPSTASH_TOKEN}'},
+                         timeout=5)
+        return r.json().get('result')
+    except Exception:
+        return None
 
 # ── Ford token management ─────────────────────────────────────────────────────
 def _login_with_password(email, password):
@@ -97,6 +130,7 @@ def _refresh_ford_token():
     _ford['expires_at']   = time.time() + int(data.get('expires_in', 1800)) - 60
     if data.get('refresh_token'):
         _ford['refresh_token'] = data['refresh_token']
+        _upstash_save(_ford['refresh_token'])
     _auto['access_token'] = None  # invalidate autonomic token
 
 def get_ford_token():
@@ -437,10 +471,12 @@ def auth_complete():
         _ford['expires_at']    = time.time() + int(data.get('expires_in', 1800)) - 60
         _ford['code_verifier'] = None
         _auto['access_token']  = None
+        _upstash_save(_ford['refresh_token'])
 
+        rt = _ford.get('refresh_token', '')
         return render_template_string(AUTH_PAGE, auth_url='', authenticated=True,
-                                      message='✅ Authentication successful! Your Pebble app is ready.',
-                                      success=True)
+                                      message=f'✅ Authentication successful! Save this refresh token to FORD_REFRESH_TOKEN in Render: {rt}',
+                                      success=True, refresh_token=rt)
     except Exception as e:
         return render_template_string(AUTH_PAGE, auth_url='', authenticated=False,
                                       message=f'Auth failed: {str(e)}', success=False)
