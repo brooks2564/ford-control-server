@@ -497,16 +497,14 @@ def get_refresh_token():
         return jsonify({'error': 'not authenticated'}), 403
     return jsonify({'refresh_token': _ford['refresh_token']})
 
-@app.route('/telemetry-keys')
+@app.route('/raw-metrics')
 @require_api_key
-def telemetry_keys():
+def raw_metrics():
     try:
         data = get_vehicle_status()
         metrics = data.get('metrics', {})
-        states  = data.get('states',  {})
-        keys_of_interest = ['tirePressure', 'doorStatus', 'tirePressureStatus', 'hoodStatus']
-        values = {k: metrics.get(k) for k in keys_of_interest}
-        return jsonify({'metric_keys': sorted(metrics.keys()), 'state_keys': sorted(states.keys()), 'values': values})
+        keys_of_interest = ['tirePressure', 'tirePressureStatus', 'doorStatus', 'hoodStatus', 'windowStatus']
+        return jsonify({k: metrics.get(k) for k in keys_of_interest})
     except Exception as e:
         return jsonify({'error': str(e)}), 502
 
